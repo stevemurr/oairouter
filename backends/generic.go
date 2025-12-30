@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/stevemurr/oairouter"
@@ -19,13 +20,13 @@ import (
 
 // GenericBackend proxies requests to any OpenAI-compatible server.
 type GenericBackend struct {
-	id         string
+	id          string
 	backendType oairouter.BackendType
-	baseURL    *url.URL
-	httpClient *http.Client
+	baseURL     *url.URL
+	httpClient  *http.Client
 
+	healthy atomic.Bool
 	mu      sync.RWMutex
-	healthy bool
 	models  []types.Model
 }
 
@@ -60,8 +61,8 @@ func NewGenericBackend(id string, baseURL string, opts ...GenericBackendOption) 
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute, // Long timeout for completions
 		},
-		healthy: true,
 	}
+	b.healthy.Store(true)
 
 	for _, opt := range opts {
 		opt(b)
@@ -83,15 +84,11 @@ func (b *GenericBackend) BaseURL() *url.URL {
 }
 
 func (b *GenericBackend) IsHealthy() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.healthy
+	return b.healthy.Load()
 }
 
 func (b *GenericBackend) setHealthy(healthy bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.healthy = healthy
+	b.healthy.Store(healthy)
 }
 
 func (b *GenericBackend) HealthCheck(ctx context.Context) error {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/stevemurr/oairouter/streaming"
@@ -45,11 +46,10 @@ type Router struct {
 	defaultBackend      string
 	healthCheckInterval time.Duration
 
-	mux      *http.ServeMux
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	mu       sync.RWMutex
-	started  bool
+	mux     *http.ServeMux
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	started atomic.Bool
 }
 
 // NewRouter creates a new router with functional options.
@@ -86,13 +86,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 // Start begins discovery and health monitoring.
 func (r *Router) Start(ctx context.Context) error {
-	r.mu.Lock()
-	if r.started {
-		r.mu.Unlock()
+	if !r.started.CompareAndSwap(false, true) {
 		return nil
 	}
-	r.started = true
-	r.mu.Unlock()
 
 	ctx, r.cancel = context.WithCancel(ctx)
 
@@ -132,12 +128,9 @@ func (r *Router) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the router.
 func (r *Router) Stop(ctx context.Context) error {
-	r.mu.Lock()
-	if !r.started {
-		r.mu.Unlock()
+	if !r.started.CompareAndSwap(true, false) {
 		return nil
 	}
-	r.mu.Unlock()
 
 	if r.cancel != nil {
 		r.cancel()
