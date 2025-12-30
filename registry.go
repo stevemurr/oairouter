@@ -127,9 +127,10 @@ func (r *BackendRegistry) AllBackends() []Backend {
 }
 
 // AllModels returns all available models across all backends.
+// It also updates the model index to ensure lookups work.
 func (r *BackendRegistry) AllModels(ctx context.Context) []types.Model {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	var allModels []types.Model
 	seen := make(map[string]bool)
@@ -140,6 +141,9 @@ func (r *BackendRegistry) AllModels(ctx context.Context) []types.Model {
 			continue
 		}
 		for _, model := range models {
+			// Update model index
+			r.addModelMapping(model.ID, backend.ID())
+
 			if !seen[model.ID] {
 				seen[model.ID] = true
 				allModels = append(allModels, model)
