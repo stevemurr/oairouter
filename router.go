@@ -3,7 +3,6 @@ package oairouter
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -216,33 +215,44 @@ func (r *Router) healthCheckLoop(ctx context.Context) {
 	}
 }
 
-func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request) {
-	var chatReq types.ChatCompletionRequest
-	if err := json.NewDecoder(req.Body).Decode(&chatReq); err != nil {
+// handlerConfig defines the operations for handling a specific API request type.
+type handlerConfig[Req any, Resp any] struct {
+	getModel     func(*Req) string
+	execute      func(Backend, context.Context, *Req) (*Resp, error)
+	stream       func(Backend, context.Context, *Req) (<-chan StreamEvent, error)
+	isStreaming  func(*Req) bool
+	errorContext string
+}
+
+// handleAPIRequest is the generic handler for all API request types.
+func handleAPIRequest[Req any, Resp any](r *Router, w http.ResponseWriter, req *http.Request, cfg handlerConfig[Req, Resp]) {
+	var apiReq Req
+	if err := json.NewDecoder(req.Body).Decode(&apiReq); err != nil {
 		types.WriteError(w, http.StatusBadRequest, types.InvalidRequestError("invalid request body: "+err.Error()))
 		return
 	}
 
-	backend, ok := r.registry.LookupByModel(chatReq.Model)
+	model := cfg.getModel(&apiReq)
+	backend, ok := r.registry.LookupByModel(model)
 	if !ok {
-		// Try default backend
 		if r.defaultBackend != "" {
 			backend, ok = r.registry.LookupByID(r.defaultBackend)
 		}
 		if !ok {
-			types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+chatReq.Model))
+			types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+model))
 			return
 		}
 	}
 
-	if chatReq.Stream {
-		r.handleChatCompletionsStream(w, req, backend, &chatReq)
+	// Handle streaming if supported and requested
+	if cfg.stream != nil && cfg.isStreaming != nil && cfg.isStreaming(&apiReq) {
+		handleStream(r, w, req, backend, &apiReq, cfg.stream, cfg.errorContext)
 		return
 	}
 
-	resp, err := backend.ChatCompletion(req.Context(), &chatReq)
+	resp, err := cfg.execute(backend, req.Context(), &apiReq)
 	if err != nil {
-		r.logger.Error("chat completion failed", "backend", backend.ID(), "error", err)
+		r.logger.Error(cfg.errorContext+" failed", "backend", backend.ID(), "error", err)
 		types.WriteError(w, http.StatusInternalServerError, types.ServerError("backend error: "+err.Error()))
 		return
 	}
@@ -251,16 +261,17 @@ func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request)
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Request, backend Backend, chatReq *types.ChatCompletionRequest) {
+// handleStream is the generic streaming handler.
+func handleStream[Req any](r *Router, w http.ResponseWriter, req *http.Request, backend Backend, apiReq *Req, streamFn func(Backend, context.Context, *Req) (<-chan StreamEvent, error), errorContext string) {
 	sse := streaming.NewWriter(w)
 	if sse == nil {
 		types.WriteError(w, http.StatusInternalServerError, types.ServerError("streaming not supported"))
 		return
 	}
 
-	events, err := backend.ChatCompletionStream(req.Context(), chatReq)
+	events, err := streamFn(backend, req.Context(), apiReq)
 	if err != nil {
-		r.logger.Error("chat completion stream failed", "backend", backend.ID(), "error", err)
+		r.logger.Error(errorContext+" stream failed", "backend", backend.ID(), "error", err)
 		types.WriteError(w, http.StatusInternalServerError, types.ServerError("backend error: "+err.Error()))
 		return
 	}
@@ -275,12 +286,7 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		}
 
 		if event.Done {
-			if event.Data == "[DONE]" {
-				sse.WriteDone()
-			} else {
-				// EOF or other clean termination without [DONE] from backend
-				sse.WriteDone()
-			}
+			sse.WriteDone()
 			streamEnded = true
 			break
 		}
@@ -293,121 +299,56 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 		}
 	}
 
-	// Ensure [DONE] is sent even if stream ended abnormally
 	if !streamEnded {
 		sse.WriteDone()
 	}
+}
+
+// Handler configurations for each endpoint type
+var chatCompletionConfig = handlerConfig[types.ChatCompletionRequest, types.ChatCompletionResponse]{
+	getModel: func(r *types.ChatCompletionRequest) string { return r.Model },
+	execute: func(b Backend, ctx context.Context, r *types.ChatCompletionRequest) (*types.ChatCompletionResponse, error) {
+		return b.ChatCompletion(ctx, r)
+	},
+	stream: func(b Backend, ctx context.Context, r *types.ChatCompletionRequest) (<-chan StreamEvent, error) {
+		return b.ChatCompletionStream(ctx, r)
+	},
+	isStreaming:  func(r *types.ChatCompletionRequest) bool { return r.Stream },
+	errorContext: "chat completion",
+}
+
+var completionConfig = handlerConfig[types.CompletionRequest, types.CompletionResponse]{
+	getModel: func(r *types.CompletionRequest) string { return r.Model },
+	execute: func(b Backend, ctx context.Context, r *types.CompletionRequest) (*types.CompletionResponse, error) {
+		return b.Completion(ctx, r)
+	},
+	stream: func(b Backend, ctx context.Context, r *types.CompletionRequest) (<-chan StreamEvent, error) {
+		return b.CompletionStream(ctx, r)
+	},
+	isStreaming:  func(r *types.CompletionRequest) bool { return r.Stream },
+	errorContext: "completion",
+}
+
+var embeddingsConfig = handlerConfig[types.EmbeddingsRequest, types.EmbeddingsResponse]{
+	getModel: func(r *types.EmbeddingsRequest) string { return r.Model },
+	execute: func(b Backend, ctx context.Context, r *types.EmbeddingsRequest) (*types.EmbeddingsResponse, error) {
+		return b.Embeddings(ctx, r)
+	},
+	stream:       nil,
+	isStreaming:  nil,
+	errorContext: "embeddings",
+}
+
+func (r *Router) handleChatCompletions(w http.ResponseWriter, req *http.Request) {
+	handleAPIRequest(r, w, req, chatCompletionConfig)
 }
 
 func (r *Router) handleCompletions(w http.ResponseWriter, req *http.Request) {
-	var compReq types.CompletionRequest
-	if err := json.NewDecoder(req.Body).Decode(&compReq); err != nil {
-		types.WriteError(w, http.StatusBadRequest, types.InvalidRequestError("invalid request body: "+err.Error()))
-		return
-	}
-
-	backend, ok := r.registry.LookupByModel(compReq.Model)
-	if !ok {
-		if r.defaultBackend != "" {
-			backend, ok = r.registry.LookupByID(r.defaultBackend)
-		}
-		if !ok {
-			types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+compReq.Model))
-			return
-		}
-	}
-
-	if compReq.Stream {
-		r.handleCompletionsStream(w, req, backend, &compReq)
-		return
-	}
-
-	resp, err := backend.Completion(req.Context(), &compReq)
-	if err != nil {
-		r.logger.Error("completion failed", "backend", backend.ID(), "error", err)
-		types.WriteError(w, http.StatusInternalServerError, types.ServerError("backend error: "+err.Error()))
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (r *Router) handleCompletionsStream(w http.ResponseWriter, req *http.Request, backend Backend, compReq *types.CompletionRequest) {
-	sse := streaming.NewWriter(w)
-	if sse == nil {
-		types.WriteError(w, http.StatusInternalServerError, types.ServerError("streaming not supported"))
-		return
-	}
-
-	events, err := backend.CompletionStream(req.Context(), compReq)
-	if err != nil {
-		r.logger.Error("completion stream failed", "backend", backend.ID(), "error", err)
-		types.WriteError(w, http.StatusInternalServerError, types.ServerError("backend error: "+err.Error()))
-		return
-	}
-
-	sse.WriteHeaders()
-
-	streamEnded := false
-	for event := range events {
-		if event.Err != nil {
-			r.logger.Error("stream error", "backend", backend.ID(), "error", event.Err)
-			break
-		}
-
-		if event.Done {
-			if event.Data == "[DONE]" {
-				sse.WriteDone()
-			} else {
-				// EOF or other clean termination without [DONE] from backend
-				sse.WriteDone()
-			}
-			streamEnded = true
-			break
-		}
-
-		if event.Data != "" {
-			if err := sse.WriteData(event.Data); err != nil {
-				r.logger.Debug("failed to write SSE data", "error", err)
-				break
-			}
-		}
-	}
-
-	// Ensure [DONE] is sent even if stream ended abnormally
-	if !streamEnded {
-		sse.WriteDone()
-	}
+	handleAPIRequest(r, w, req, completionConfig)
 }
 
 func (r *Router) handleEmbeddings(w http.ResponseWriter, req *http.Request) {
-	var embReq types.EmbeddingsRequest
-	if err := json.NewDecoder(req.Body).Decode(&embReq); err != nil {
-		types.WriteError(w, http.StatusBadRequest, types.InvalidRequestError("invalid request body: "+err.Error()))
-		return
-	}
-
-	backend, ok := r.registry.LookupByModel(embReq.Model)
-	if !ok {
-		if r.defaultBackend != "" {
-			backend, ok = r.registry.LookupByID(r.defaultBackend)
-		}
-		if !ok {
-			types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+embReq.Model))
-			return
-		}
-	}
-
-	resp, err := backend.Embeddings(req.Context(), &embReq)
-	if err != nil {
-		r.logger.Error("embeddings failed", "backend", backend.ID(), "error", err)
-		types.WriteError(w, http.StatusInternalServerError, types.ServerError("backend error: "+err.Error()))
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	handleAPIRequest(r, w, req, embeddingsConfig)
 }
 
 func (r *Router) handleListModels(w http.ResponseWriter, req *http.Request) {
@@ -476,14 +417,4 @@ func (r *Router) handleHealth(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
-}
-
-// readBody reads and returns the request body, allowing it to be read again.
-func readBody(req *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
-	}
-	req.Body.Close()
-	return body, nil
 }

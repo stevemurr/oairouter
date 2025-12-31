@@ -162,16 +162,9 @@ func (b *GenericBackend) ChatCompletion(ctx context.Context, chatReq *types.Chat
 	return &chatResp, nil
 }
 
-func (b *GenericBackend) ChatCompletionStream(ctx context.Context, chatReq *types.ChatCompletionRequest) (<-chan oairouter.StreamEvent, error) {
-	u := b.baseURL.JoinPath("/v1/chat/completions")
-
-	// Ensure streaming is enabled
-	chatReq.Stream = true
-
-	body, err := json.Marshal(chatReq)
-	if err != nil {
-		return nil, err
-	}
+// streamRequest handles the common SSE streaming pattern for any endpoint.
+func (b *GenericBackend) streamRequest(ctx context.Context, endpoint string, body []byte) (<-chan oairouter.StreamEvent, error) {
+	u := b.baseURL.JoinPath(endpoint)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
@@ -188,7 +181,7 @@ func (b *GenericBackend) ChatCompletionStream(ctx context.Context, chatReq *type
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("chat completion stream failed: %s - %s", resp.Status, string(respBody))
+		return nil, fmt.Errorf("stream request failed: %s - %s", resp.Status, string(respBody))
 	}
 
 	events := make(chan oairouter.StreamEvent, 100)
@@ -220,16 +213,11 @@ func (b *GenericBackend) ChatCompletionStream(ctx context.Context, chatReq *type
 			}
 
 			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			if !strings.HasPrefix(line, "data: ") {
+			if line == "" || !strings.HasPrefix(line, "data: ") {
 				continue
 			}
 
 			data := strings.TrimPrefix(line, "data: ")
-
 			if data == "[DONE]" {
 				events <- oairouter.StreamEvent{Data: data, Done: true}
 				return
@@ -240,6 +228,15 @@ func (b *GenericBackend) ChatCompletionStream(ctx context.Context, chatReq *type
 	}()
 
 	return events, nil
+}
+
+func (b *GenericBackend) ChatCompletionStream(ctx context.Context, chatReq *types.ChatCompletionRequest) (<-chan oairouter.StreamEvent, error) {
+	chatReq.Stream = true
+	body, err := json.Marshal(chatReq)
+	if err != nil {
+		return nil, err
+	}
+	return b.streamRequest(ctx, "/v1/chat/completions", body)
 }
 
 func (b *GenericBackend) Completion(ctx context.Context, compReq *types.CompletionRequest) (*types.CompletionResponse, error) {
@@ -276,83 +273,12 @@ func (b *GenericBackend) Completion(ctx context.Context, compReq *types.Completi
 }
 
 func (b *GenericBackend) CompletionStream(ctx context.Context, compReq *types.CompletionRequest) (<-chan oairouter.StreamEvent, error) {
-	u := b.baseURL.JoinPath("/v1/completions")
-
-	// Ensure streaming is enabled
 	compReq.Stream = true
-
 	body, err := json.Marshal(compReq)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, fmt.Errorf("completion stream failed: %s - %s", resp.Status, string(respBody))
-	}
-
-	events := make(chan oairouter.StreamEvent, 100)
-
-	go func() {
-		defer close(events)
-		defer resp.Body.Close()
-
-		reader := bufio.NewReader(resp.Body)
-		for {
-			select {
-			case <-ctx.Done():
-				events <- oairouter.StreamEvent{Err: ctx.Err(), Done: true}
-				return
-			default:
-			}
-
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				// Send error event for non-EOF errors, but always send Done
-				// to ensure the stream terminates properly for the client
-				if err != io.EOF {
-					events <- oairouter.StreamEvent{Err: err, Done: true}
-				} else {
-					// EOF without [DONE] - signal clean termination
-					events <- oairouter.StreamEvent{Done: true}
-				}
-				return
-			}
-
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-
-			data := strings.TrimPrefix(line, "data: ")
-
-			if data == "[DONE]" {
-				events <- oairouter.StreamEvent{Data: data, Done: true}
-				return
-			}
-
-			events <- oairouter.StreamEvent{Data: data}
-		}
-	}()
-
-	return events, nil
+	return b.streamRequest(ctx, "/v1/completions", body)
 }
 
 func (b *GenericBackend) Embeddings(ctx context.Context, embReq *types.EmbeddingsRequest) (*types.EmbeddingsResponse, error) {
