@@ -208,8 +208,13 @@ func (b *GenericBackend) ChatCompletionStream(ctx context.Context, chatReq *type
 
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				// Send error event for non-EOF errors, but always send Done
+				// to ensure the stream terminates properly for the client
 				if err != io.EOF {
 					events <- oairouter.StreamEvent{Err: err, Done: true}
+				} else {
+					// EOF without [DONE] - signal clean termination
+					events <- oairouter.StreamEvent{Done: true}
 				}
 				return
 			}
@@ -316,8 +321,13 @@ func (b *GenericBackend) CompletionStream(ctx context.Context, compReq *types.Co
 
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				// Send error event for non-EOF errors, but always send Done
+				// to ensure the stream terminates properly for the client
 				if err != io.EOF {
 					events <- oairouter.StreamEvent{Err: err, Done: true}
+				} else {
+					// EOF without [DONE] - signal clean termination
+					events <- oairouter.StreamEvent{Done: true}
 				}
 				return
 			}

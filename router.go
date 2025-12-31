@@ -267,14 +267,21 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 
 	sse.WriteHeaders()
 
+	streamEnded := false
 	for event := range events {
 		if event.Err != nil {
 			r.logger.Error("stream error", "backend", backend.ID(), "error", event.Err)
 			break
 		}
 
-		if event.Done && event.Data == "[DONE]" {
-			sse.WriteDone()
+		if event.Done {
+			if event.Data == "[DONE]" {
+				sse.WriteDone()
+			} else {
+				// EOF or other clean termination without [DONE] from backend
+				sse.WriteDone()
+			}
+			streamEnded = true
 			break
 		}
 
@@ -284,6 +291,11 @@ func (r *Router) handleChatCompletionsStream(w http.ResponseWriter, req *http.Re
 				break
 			}
 		}
+	}
+
+	// Ensure [DONE] is sent even if stream ended abnormally
+	if !streamEnded {
+		sse.WriteDone()
 	}
 }
 
@@ -337,14 +349,21 @@ func (r *Router) handleCompletionsStream(w http.ResponseWriter, req *http.Reques
 
 	sse.WriteHeaders()
 
+	streamEnded := false
 	for event := range events {
 		if event.Err != nil {
 			r.logger.Error("stream error", "backend", backend.ID(), "error", event.Err)
 			break
 		}
 
-		if event.Done && event.Data == "[DONE]" {
-			sse.WriteDone()
+		if event.Done {
+			if event.Data == "[DONE]" {
+				sse.WriteDone()
+			} else {
+				// EOF or other clean termination without [DONE] from backend
+				sse.WriteDone()
+			}
+			streamEnded = true
 			break
 		}
 
@@ -354,6 +373,11 @@ func (r *Router) handleCompletionsStream(w http.ResponseWriter, req *http.Reques
 				break
 			}
 		}
+	}
+
+	// Ensure [DONE] is sent even if stream ended abnormally
+	if !streamEnded {
+		sse.WriteDone()
 	}
 }
 
