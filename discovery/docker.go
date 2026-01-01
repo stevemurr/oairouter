@@ -16,61 +16,30 @@ import (
 	"github.com/stevemurr/oairouter/backends"
 )
 
-// ImageRule maps Docker image patterns to backend types.
-type ImageRule struct {
-	Pattern     string
-	BackendType oairouter.BackendType
-	PortLabel   string // Docker label containing port (optional)
-	ModelLabel  string // Docker label containing model ID (optional)
-	DefaultPort int    // Default port if not specified
-}
-
-// DefaultImageRules are built-in rules for common LLM backends.
-var DefaultImageRules = []ImageRule{
-	{
-		Pattern:     "vllm/vllm-openai",
-		BackendType: oairouter.BackendVLLM,
-		PortLabel:   "vllm-manager.port",
-		ModelLabel:  "vllm-manager.model",
-		DefaultPort: 8000,
-	},
-	{
-		Pattern:     "nvcr.io/nvidia/vllm",
-		BackendType: oairouter.BackendVLLM,
-		PortLabel:   "vllm-manager.port",
-		ModelLabel:  "vllm-manager.model",
-		DefaultPort: 8000,
-	},
-	{
-		Pattern:     "ollama/ollama",
-		BackendType: oairouter.BackendOllama,
-		DefaultPort: 11434,
-	},
-	{
-		Pattern:     "ghcr.io/ggerganov/llama.cpp",
-		BackendType: oairouter.BackendLlamaCpp,
-		DefaultPort: 8080,
-	},
+// LabelConfig defines the label schema for container discovery.
+// Containers must have the enabled label set to "true" to be discovered.
+type LabelConfig struct {
+	Prefix         string // Label prefix, e.g., "oairouter." or "llm.manager/"
+	EnabledKey     string // Key for enabled flag, e.g., "enabled"
+	BackendTypeKey string // Key for backend type, e.g., "backend"
+	PortKey        string // Key for port, e.g., "port"
+	ModelKey       string // Key for model ID, e.g., "model"
+	URLKey         string // Key for full URL override, e.g., "url"
+	DefaultHost    string // Default host when URL not specified, e.g., "localhost"
 }
 
 // DockerDiscoverer finds LLM backends running in Docker containers.
+// Containers opt-in to discovery by setting the enabled label to "true".
 type DockerDiscoverer struct {
-	client     *client.Client
-	imageRules []ImageRule
-	ownClient  bool
+	client    *client.Client
+	labels    LabelConfig
+	ownClient bool
 }
 
 // DockerOption configures the Docker discoverer.
 type DockerOption func(*DockerDiscoverer)
 
-// WithImageRule adds a custom image rule.
-func WithImageRule(rule ImageRule) DockerOption {
-	return func(d *DockerDiscoverer) {
-		d.imageRules = append(d.imageRules, rule)
-	}
-}
-
-// WithDockerClient uses an existing Docker client.
+// WithDockerClient uses an existing Docker client (useful for testing).
 func WithDockerClient(c *client.Client) DockerOption {
 	return func(d *DockerDiscoverer) {
 		d.client = c
@@ -78,11 +47,12 @@ func WithDockerClient(c *client.Client) DockerOption {
 	}
 }
 
-// NewDockerDiscoverer creates a new Docker discoverer.
-func NewDockerDiscoverer(opts ...DockerOption) (*DockerDiscoverer, error) {
+// NewDockerDiscoverer creates a new Docker discoverer with the given label configuration.
+// Containers must have the label "{Prefix}{EnabledKey}" set to "true" to be discovered.
+func NewDockerDiscoverer(labels LabelConfig, opts ...DockerOption) (*DockerDiscoverer, error) {
 	d := &DockerDiscoverer{
-		imageRules: DefaultImageRules,
-		ownClient:  true,
+		labels:    labels,
+		ownClient: true,
 	}
 
 	for _, opt := range opts {
@@ -197,44 +167,32 @@ func (d *DockerDiscoverer) handleDockerEvent(ctx context.Context, event events.M
 }
 
 func (d *DockerDiscoverer) containerToBackend(c types.Container) (oairouter.Backend, bool) {
-	// Match against image rules
-	var matchedRule *ImageRule
-	for i := range d.imageRules {
-		rule := &d.imageRules[i]
-		if matchesPattern(c.Image, rule.Pattern) {
-			matchedRule = rule
-			break
-		}
-	}
-
-	if matchedRule == nil {
+	// 1. Check enabled label (required)
+	enabledLabel := d.labels.Prefix + d.labels.EnabledKey
+	if c.Labels[enabledLabel] != "true" {
 		return nil, false
 	}
 
-	// Extract port
-	port := matchedRule.DefaultPort
-	if matchedRule.PortLabel != "" {
-		if portStr, ok := c.Labels[matchedRule.PortLabel]; ok {
-			if p, err := strconv.Atoi(portStr); err == nil {
-				port = p
-			}
+	// 2. Get backend type from label (default: generic)
+	backendType := oairouter.BackendGeneric
+	if d.labels.BackendTypeKey != "" {
+		if typeStr := c.Labels[d.labels.Prefix+d.labels.BackendTypeKey]; typeStr != "" {
+			backendType = oairouter.BackendType(typeStr)
 		}
 	}
 
-	// Build backend ID
-	name := c.ID[:12]
-	if len(c.Names) > 0 {
-		name = strings.TrimPrefix(c.Names[0], "/")
-	}
-	id := fmt.Sprintf("%s-%s", matchedRule.BackendType, name)
+	// 3. Get base URL
+	baseURL := d.getBaseURL(c, backendType)
 
-	// Build URL
-	baseURL := fmt.Sprintf("http://localhost:%d", port)
+	// 4. Build backend ID from container name
+	name := d.containerName(c)
+	id := fmt.Sprintf("%s-%s", backendType, name)
 
+	// 5. Create backend
 	backend, err := backends.NewGenericBackend(
 		id,
 		baseURL,
-		backends.WithBackendType(matchedRule.BackendType),
+		backends.WithBackendType(backendType),
 	)
 	if err != nil {
 		return nil, false
@@ -243,24 +201,51 @@ func (d *DockerDiscoverer) containerToBackend(c types.Container) (oairouter.Back
 	return backend, true
 }
 
-// matchesPattern checks if an image name matches a pattern.
-// Patterns can use * as a wildcard.
-func matchesPattern(image, pattern string) bool {
-	// Simple prefix match for now
-	// "vllm/vllm-openai" matches "vllm/vllm-openai:latest"
-	if strings.HasPrefix(image, pattern) {
-		return true
-	}
-
-	// Handle wildcard patterns
-	if strings.Contains(pattern, "*") {
-		parts := strings.Split(pattern, "*")
-		if len(parts) == 2 {
-			return strings.HasPrefix(image, parts[0]) && strings.HasSuffix(image, parts[1])
+// getBaseURL returns the base URL for the container.
+// If URLKey label is set, uses that directly. Otherwise constructs from DefaultHost + port.
+func (d *DockerDiscoverer) getBaseURL(c types.Container, backendType oairouter.BackendType) string {
+	// Check for full URL override
+	if d.labels.URLKey != "" {
+		if url := c.Labels[d.labels.Prefix+d.labels.URLKey]; url != "" {
+			return url
 		}
 	}
 
-	return false
+	// Construct from DefaultHost + port
+	port := defaultPortForType(backendType)
+	if d.labels.PortKey != "" {
+		if portStr := c.Labels[d.labels.Prefix+d.labels.PortKey]; portStr != "" {
+			if p, err := strconv.Atoi(portStr); err == nil {
+				port = p
+			}
+		}
+	}
+
+	return fmt.Sprintf("http://%s:%d", d.labels.DefaultHost, port)
+}
+
+// containerName extracts a clean name from the container.
+func (d *DockerDiscoverer) containerName(c types.Container) string {
+	if len(c.Names) > 0 {
+		return strings.TrimPrefix(c.Names[0], "/")
+	}
+	return c.ID[:12]
+}
+
+// defaultPortForType returns the standard port for a backend type.
+func defaultPortForType(t oairouter.BackendType) int {
+	switch t {
+	case oairouter.BackendVLLM:
+		return 8000
+	case oairouter.BackendOllama:
+		return 11434
+	case oairouter.BackendLlamaCpp:
+		return 8080
+	case oairouter.BackendLMStudio:
+		return 1234
+	default:
+		return 8080
+	}
 }
 
 // Close closes the Docker client if owned by this discoverer.
