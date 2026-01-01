@@ -44,6 +44,7 @@ type Router struct {
 	logger              *slog.Logger
 	defaultBackend      string
 	healthCheckInterval time.Duration
+	sessionAffinity     bool // Enable session affinity via X-Session-ID header
 
 	mux     *http.ServeMux
 	cancel  context.CancelFunc
@@ -233,15 +234,45 @@ func handleAPIRequest[Req any, Resp any](r *Router, w http.ResponseWriter, req *
 	}
 
 	model := cfg.getModel(&apiReq)
-	backend, ok := r.registry.LookupByModel(model)
-	if !ok {
-		if r.defaultBackend != "" {
-			backend, ok = r.registry.LookupByID(r.defaultBackend)
+
+	var backend Backend
+	var sessionBroken bool
+
+	if r.sessionAffinity {
+		// Use session affinity if enabled
+		sessionID := req.Header.Get(SessionHeader)
+		result, ok := r.registry.LookupByModelWithSession(model, sessionID)
+		if ok {
+			backend = result.Backend
+			sessionBroken = result.SessionBroken
 		}
 		if !ok {
-			types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+model))
-			return
+			if r.defaultBackend != "" {
+				backend, ok = r.registry.LookupByID(r.defaultBackend)
+			}
+			if !ok {
+				types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+model))
+				return
+			}
 		}
+	} else {
+		// Use default lookup
+		var ok bool
+		backend, ok = r.registry.LookupByModel(model)
+		if !ok {
+			if r.defaultBackend != "" {
+				backend, ok = r.registry.LookupByID(r.defaultBackend)
+			}
+			if !ok {
+				types.WriteError(w, http.StatusNotFound, types.NotFoundError("model not found: "+model))
+				return
+			}
+		}
+	}
+
+	// Set session broken header if preferred backend was unhealthy
+	if sessionBroken {
+		w.Header().Set(SessionBrokenHeader, "true")
 	}
 
 	// Handle streaming if supported and requested

@@ -3,10 +3,18 @@ package oairouter
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
+	"sort"
 	"sync"
 
 	"github.com/stevemurr/oairouter/types"
 )
+
+// SessionHeader is the HTTP header used for session affinity.
+const SessionHeader = "X-Session-ID"
+
+// SessionBrokenHeader is set in responses when session affinity couldn't be maintained.
+const SessionBrokenHeader = "X-Session-Broken"
 
 // BackendRegistry manages model-to-backend routing.
 type BackendRegistry struct {
@@ -103,6 +111,93 @@ func (r *BackendRegistry) LookupByModel(modelID string) (Backend, bool) {
 	}
 
 	return nil, false
+}
+
+// LookupResult contains the backend lookup result with session affinity metadata.
+type LookupResult struct {
+	Backend       Backend
+	SessionBroken bool // True if preferred backend was unhealthy and fallback was used
+}
+
+// LookupByModelWithSession finds a backend using session affinity via consistent hashing.
+// If sessionID is empty, falls back to first-healthy selection (LookupByModel behavior).
+// If the preferred backend (based on session hash) is unhealthy, falls back to another
+// healthy backend and sets SessionBroken=true in the result.
+func (r *BackendRegistry) LookupByModelWithSession(modelID, sessionID string) (LookupResult, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	backendIDs, ok := r.models[modelID]
+	if !ok || len(backendIDs) == 0 {
+		return LookupResult{}, false
+	}
+
+	// No session - use first-healthy selection
+	if sessionID == "" {
+		for _, bid := range backendIDs {
+			backend, ok := r.backends[bid]
+			if ok && backend.IsHealthy() {
+				return LookupResult{Backend: backend, SessionBroken: false}, true
+			}
+		}
+		// No healthy backend, return first anyway
+		if backend, ok := r.backends[backendIDs[0]]; ok {
+			return LookupResult{Backend: backend, SessionBroken: false}, true
+		}
+		return LookupResult{}, false
+	}
+
+	// Get healthy backends for this model, sorted by ID for consistent ordering
+	healthyBackends := make([]Backend, 0, len(backendIDs))
+	var allBackends []Backend
+	for _, bid := range backendIDs {
+		backend, ok := r.backends[bid]
+		if !ok {
+			continue
+		}
+		allBackends = append(allBackends, backend)
+		if backend.IsHealthy() {
+			healthyBackends = append(healthyBackends, backend)
+		}
+	}
+
+	// Sort for consistent ordering (backends may be registered in different order)
+	sort.Slice(allBackends, func(i, j int) bool {
+		return allBackends[i].ID() < allBackends[j].ID()
+	})
+	sort.Slice(healthyBackends, func(i, j int) bool {
+		return healthyBackends[i].ID() < healthyBackends[j].ID()
+	})
+
+	if len(allBackends) == 0 {
+		return LookupResult{}, false
+	}
+
+	// Compute preferred backend using consistent hashing over ALL backends
+	preferredIndex := hashSessionToIndex(sessionID, len(allBackends))
+	preferredBackend := allBackends[preferredIndex]
+
+	// If preferred backend is healthy, use it
+	if preferredBackend.IsHealthy() {
+		return LookupResult{Backend: preferredBackend, SessionBroken: false}, true
+	}
+
+	// Preferred backend unhealthy - fall back to a healthy one
+	if len(healthyBackends) > 0 {
+		// Use consistent hashing on healthy backends as fallback
+		fallbackIndex := hashSessionToIndex(sessionID, len(healthyBackends))
+		return LookupResult{Backend: healthyBackends[fallbackIndex], SessionBroken: true}, true
+	}
+
+	// No healthy backends - return preferred (unhealthy) backend anyway
+	return LookupResult{Backend: preferredBackend, SessionBroken: true}, true
+}
+
+// hashSessionToIndex uses FNV-1a hashing to consistently map a session ID to an index.
+func hashSessionToIndex(sessionID string, count int) int {
+	h := fnv.New32a()
+	h.Write([]byte(sessionID))
+	return int(h.Sum32() % uint32(count))
 }
 
 // LookupByID finds a backend by its ID.
