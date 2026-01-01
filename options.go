@@ -48,3 +48,15 @@ func WithDiscoverer(d Discoverer) Option {
 		return nil
 	}
 }
+
+// WithSessionAffinity enables session affinity via the X-Session-ID header.
+// When enabled, requests with the same session ID are consistently routed to
+// the same backend using consistent hashing. If the preferred backend is
+// unhealthy, the request falls back to another healthy backend and sets
+// the X-Session-Broken response header to indicate session state may be lost.
+func WithSessionAffinity(enabled bool) Option {
+	return func(r *Router) error {
+		r.sessionAffinity = enabled
+		return nil
+	}
+}
